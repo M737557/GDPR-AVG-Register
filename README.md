@@ -40,7 +40,7 @@ basic_viewer.php
 //Eigenlijk simpel kijken welke activiteiten je wil verwijderen of behouden. Snelle review doen.
 
 leesbaar.php
-//Eigenlijk een table dump maar dan zonder compact view. 
+//Eigenlijk een database table viewer maar dan zonder de compact view. 
 
 viewer.php
 //AVG register viewer beheer hier jouw avg register.
@@ -56,11 +56,17 @@ contact_vertegenwoordiger,
 naam_fg,
 contact_fg
 
-Veel succes, bij vragen kan het even duren voor ik reageer. Komen er nieuwe functie verzoeken toe kijk ik of ik deze toevoeg. Daarvoor ben ik bereikbaar om het simpel te houden wil ik ook meer uitleg geven, stuur een berichtje en vergeet mij geen koffie te doneren ;-)
+Veel succes, bij vragen kan het even duren voor ik reageer.
+Komen er nieuwe functie verzoeken post ik hieronder updates.
+Voor nieuwe functies ben ik bereikbaar. Stuur een berichtje en vergeet mij geen koffie te doneren ;-)
 
 Engelse vertaling, andere vertalingen of php funcies of vragen zijn op verzoek aan te vragen per e-mail.
 Met vriendelijke groet
 Matijn
+
+Updates/nieuwe functies:
+
+
 
 
 
