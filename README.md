@@ -64,6 +64,9 @@ Engelse vertaling, andere vertalingen of php funcies of vragen zijn op verzoek a
 Met vriendelijke groet
 Matijn
 
+Releases
+first release v.01
+
 Updates/nieuwe functies:
 
 
