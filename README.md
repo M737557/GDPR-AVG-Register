@@ -5,19 +5,19 @@ Eigenlijk is er geen php mysql AVG register beschikbaar online of het is een exc
 Daarom heb ik met een ai AVG register gemaakt op basis van een onderwijs instelling als basis.
 
 In het voorbeeld een onderwijs avg register als basis.
-Wil je zelf een ai avg register opstellen? Ga dan aan de slag met de import.sql met deepseek.com
+Wil je zelf een ai avg register opstellen? Ga dan aan de slag met de import.sql met deepseek.com ai tool.
 Laat de import.sql in deepseek.com en geef daarna de volgende opdracht:
 
 'maak een avg register voor de Toerisme sector in een mega dump in deze structuur', zonder de quotes. Toerisme sector is even het voorbeeld.
 Daarna maakt het een 100 activiteiten avg register, voldoende om mee aan de slag te gaan als basis.
-Gebruik de andere tools om data te bekijken of bewaartermijn om te kijken hoe oud de data is, de opzet was om met data retentie verder te gaan door alleen de mysql kolommen created_at en updatet_at in de gaten te houden. Om meer linair andere tools te ontwikkelen op basis van 2 jaar of andere retentie beleid.
+Gebruik de andere tools om de datase eerst te bewerken (1),(2),(2),(3). Gebruik bewaartermijn.php om te kijken hoe oud de data is, deze is zo opzet dat het in de toekomst omgaat met laatste twee database kolommen - voor data retentie tools( created_at en updatet_at) in de gaten te houden. Om meer lineair andere tools te ontwikkelen op basis van 2 jaar of andere retentie beleid...
 
 Bij vragen ben ik beschikbaar op mijn PayPal account, Buy me coffee:
 matijn@gmail.com
 
-MIT license is in het kort: mag niet worden verkocht als software wel gratis te gebruiken en te herschrijven.
+MIT license is in het kort: mag niet worden doorverkocht als software wel gratis te gebruiken en te herschrijven.
 
-Op volgorde uitvoeren files:
+Op volgorde uitvoeren files (1)(2)(2)(3):
 
 Uitleg individuele bestanden.
 1userstable.sql
@@ -30,6 +30,9 @@ admin user is: admin/admin123 zie ook de webinterface bij runnen viewer.php
 
 2systemchanges.sql
 //Review modus vereist een tabel. Hiermee heb je track op wijzigingen ten opzichten van start op de database
+
+3addcolumnsAVGregister
+//toevoegen gespeudonimseerde kolommen aan database
 
 basic_viewer.php
 //Eigenlijk simpel kijken welke activiteiten je wil verwijderen of behouden. Snelle review doen.
