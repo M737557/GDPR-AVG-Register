@@ -44,16 +44,17 @@ viewer.php
 //AVG register viewer
 
 De volgende databasetabel (avg_register) kolommen zijn gespeudonimseerd opgeslagen(avg proof zie hiervoor de php code) in de database en zijn zelf in te vullen op basis van contracten of intern personeel.
-naam_verwerkingsverantwoordelijke
-contact_verwerkingsverantwoordelijke
-naam_gezamenlijke_verwerkingsverantwoordelijke
-contact_gezamenlijke_verwerkingsverantwoordelijke
-naam_vertegenwoordiger
-contact_vertegenwoordiger
-naam_fg
+
+naam_verwerkingsverantwoordelijke,
+contact_verwerkingsverantwoordelijke,
+naam_gezamenlijke_verwerkingsverantwoordelijke,
+contact_gezamenlijke_verwerkingsverantwoordelijke,
+naam_vertegenwoordiger,
+contact_vertegenwoordiger,
+naam_fg,
 contact_fg
 
-Veel succes.
+Veel succes, bij vragen kan het even duren voor ik reageer. Komen er nieuwe functie verzoeken toe kijk ik of ik deze toevoeg. Daarvoor ben ik bereikbaar om het simpel te houden wil ik ook meer uitleg geven, stuur een berichtje en vergeet mij geen koffie te doneren ;-)
 
 
 
