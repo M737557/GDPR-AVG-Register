@@ -20,10 +20,12 @@ paypal account: matijn@gmail.com
 
 MIT license is in het kort: mag niet worden verkocht als software wel gratis te gebruiken en te herschrijven.
 
-Op volgorde runnen
-Uitleg individuele bestanden:
+Op volgorde uitvoeren files:
+
+Uitleg individuele bestanden.
 1userstable.sql
-//inloggen admin/admin123
+Maak gebruikers aan op basis van standaard passwordhash functie php
+admin user is: admin/admin123 zie ook de webinterface bij runnen viewer.php
 
 2mysqladd2columns.php
 //php bestand om 2 kolommen toe te voegen aan de database, benodigd om te zeggen wij zijn verantwoordelijk als verwerker ja/nee of derdepartij is verantwoordelijk ja/nee
