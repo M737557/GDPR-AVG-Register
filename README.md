@@ -6,11 +6,11 @@ Daarom heb ik met een ai AVG register gemaakt op basis van een onderwijs instell
 
 In het voorbeeld een onderwijs avg register als basis.
 Wil je zelf een ai avg register opstellen? Ga dan aan de slag met de import.sql met deepseek.com ai tool.
-Laat de import.sql in deepseek.com en geef daarna de volgende opdracht:
+Laad de import.sql in deepseek.com en geef daarna de volgende opdracht:
 
 'maak een avg register voor de Toerisme sector in een mega dump in deze structuur', zonder de quotes. Toerisme sector is even het voorbeeld.
 Daarna maakt het een 100 activiteiten avg register, voldoende om mee aan de slag te gaan als basis.
-Gebruik de andere tools om de datase eerst te bewerken (1),(2),(2),(3). Gebruik bewaartermijn.php om te kijken hoe oud de data is, deze is zo opzet dat het in de toekomst omgaat met laatste twee database kolommen - voor data retentie tools( created_at en updatet_at) in de gaten te houden. Om meer lineair andere tools te ontwikkelen op basis van 2 jaar of andere retentie beleid...
+Gebruik de andere tools om de datase eerst te bewerken (1),(2),(2),(3). direct in phpmyadmin SQL van de database. Begin met import.sql Gebruik bewaartermijn.php om te kijken hoe oud de data is, deze is zo opzet dat het in de toekomst omgaat met laatste twee database kolommen - voor data retentie tools( created_at en updatet_at) in de gaten te houden. Om meer lineair andere tools te ontwikkelen op basis van 2 jaar of andere retentie beleid...
 
 Bij vragen ben ik beschikbaar op mijn PayPal account, Buy me coffee:
 matijn@gmail.com
