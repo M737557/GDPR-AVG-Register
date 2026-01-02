@@ -26,13 +26,15 @@ admin user is: admin/admin123 zie ook de webinterface bij runnen viewer.php
 
 2mysqladd2columns.php
 //php bestand om 2 kolommen toe te voegen aan de database, benodigd om te zeggen wij zijn verantwoordelijk als verwerker ja/nee of derdepartij is verantwoordelijk ja/nee
-//zonder deze heb je er weinig aan.
+//deze run is vereist.
 
 2systemchanges.sql
 //Review modus vereist een tabel. Hiermee heb je track op wijzigingen ten opzichten van start op de database
+//deze run is vereist.
 
 3addcolumnsAVGregister
 //toevoegen gespeudonimseerde kolommen aan database
+//deze run is vereist.
 
 basic_viewer.php
 //Eigenlijk simpel kijken welke activiteiten je wil verwijderen of behouden. Snelle review doen.
@@ -41,7 +43,7 @@ leesbaar.php
 //Eigenlijk een table dump maar dan zonder compact view. 
 
 viewer.php
-//AVG register viewer
+//AVG register viewer beheer hier jouw avg register.
 
 De volgende databasetabel (avg_register) kolommen zijn gespeudonimseerd opgeslagen(avg proof zie hiervoor de php code) in de database en zijn zelf in te vullen op basis van contracten of intern personeel.
 
