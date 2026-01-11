@@ -67,6 +67,12 @@ second release v.02
 Updates/nieuwe functies:
 viewer versie 12
 
+Third release v.03
+Updates/nieuwe functies:
+viewer versie 15
+
+
+
 
 
 
