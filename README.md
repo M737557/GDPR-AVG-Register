@@ -38,9 +38,6 @@ admin user is: admin/admin123 zie ook de webinterface bij runnen viewer.php
 basic_viewer.php
 //Eigenlijk simpel kijken welke activiteiten je wil verwijderen of behouden. Snelle review doen.
 
-leesbaar.php
-//Eigenlijk een database table viewer maar dan zonder de compact view. 
-
 viewer.php
 //AVG register viewer beheer hier jouw avg register.
 
