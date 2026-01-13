@@ -8,7 +8,7 @@
 // added print-friendly feature
 // removed sensitive columns from print (encrypted columns are not shown in print)
 // added batch printing of all records with DPIA
-//v13 viewer
+//v16 viewer
 
 session_start();
 
