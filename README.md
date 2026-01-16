@@ -79,7 +79,8 @@ basic_viewer-exporthtml.php
 
 5th release v.05 2026-01-16
 Updates/nieuwe functies:
-viewer17.php (removed footer from buttons, compact print and Print All Records with DPIA Details 
+viewer17.php 
+(removed footer from pages - compact print and Print All Records with DPIA Details (button functions).
 
 
 
