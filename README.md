@@ -83,6 +83,12 @@ viewer17.php
 (removed footer from pages - compact print and Print All Records with DPIA Details (button functions).
 
 
+6th release v.06 2026-01-19
+Updates/nieuwe functies:
+viewer18.php 
+fixed error (is_active)
+dpa_vereist (compact print) was not displaying correct.
+
 
 
 
