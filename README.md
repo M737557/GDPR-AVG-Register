@@ -101,7 +101,9 @@ all_organizational -dedup.php
 all_technicals -dedup.php
 
 7th release v.06 2026-01-19 08:21 (CET)
-ManageUsersWeb.php (manage TOTP / multifactor keys from table system_users). If table not exists, creates it.
+ManageUsersWeb.php
+(manage TOTP / multifactor keys from table system_users). 
+If table not exists, creates it.
 
 
 
