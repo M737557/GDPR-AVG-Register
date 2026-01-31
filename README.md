@@ -107,6 +107,11 @@ If table not exists, creates it.
 updated viewer21.php for Multifactor login.
 
 
+Update 01/31/2026:
+release 8.zip (new interface)
+example list gdpr register dpias release 1.zip (example gdpr/dpia register)
+
+
 
 
 
