@@ -41,7 +41,7 @@ release 8.zip (new interface)
 
 example list gdpr register dpias release 1.zip (example gdpr/dpia register)
 
-update 02/02/2026
+update 02/01/2026
 
 example list gdpr register dpias release 2.zip
 
