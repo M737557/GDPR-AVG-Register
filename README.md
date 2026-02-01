@@ -6,7 +6,7 @@ ai gdpr Register dpia register in English based on chat.deepseek.com/en
 2. # Clipboard tool example registers (dutch companies, in English or dutch language)
 ai generate register:
 chat.deepseek.com/en
-upload insert query.txt
+upload/copy text from: insert query.txt
 
 then type as examples:
 
