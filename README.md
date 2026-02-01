@@ -4,9 +4,10 @@ ai gdpr Register dpia register in English based on chat.deepseek.com/en and mysq
 
 
 2. # Clipboard tool example registers (download) (of dutch companies, in English and in dutch language)
-php based tool
+php based tool / clipboard_summary.php
 
 change:
+
 $data_directory
 
 
