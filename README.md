@@ -1,3 +1,4 @@
+
 # GDPR-AVG-Register
 ai AVG Register in het Nederlands op basis van deepseek.com 
 
@@ -112,6 +113,8 @@ Update 01/31/2026:
 release 8.zip (new interface)
 
 example list gdpr register dpias release 1.zip (example gdpr/dpia register)
+
+example list fdpr register dpias release 2.zip
 
 
 
