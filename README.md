@@ -49,7 +49,8 @@ example list gdpr register dpias release 2.zip
 
 update 02/02/2026
 
-release8-b.zip contains working database, release8 from 2days a go was not working.
+release8-c.zip contains working mysql database, release8 db from 2days a go was not working.
+fix for mysql error, emtpy processing a. titles, dependency for printing dpias..
 
 
 
