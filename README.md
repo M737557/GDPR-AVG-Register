@@ -1,6 +1,8 @@
 update 02/04/2026 clipboard tool is now saving clippys
 
-Release 2
+Release 3
+- html
+- pdf generator (nice..)
 
 **English GDPR Register and DPIA**
 
