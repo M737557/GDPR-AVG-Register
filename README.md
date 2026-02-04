@@ -65,6 +65,7 @@ Contains 5653 entries from 97 file(s) / companies.
 change:
 
 $data_directory
+to a directory on your computer.
 
 
 
