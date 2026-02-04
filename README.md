@@ -8,6 +8,11 @@ Release 3
 - html
 - pdf generator (nice..)
 
+Release 4
+- clip.php
+- pdfgenerator.php
+ 
+
 **English GDPR Register and DPIA**
 
 ============= RELEASES +++++++++++++++
