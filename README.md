@@ -14,9 +14,10 @@ fix for mysql error, emtpy processing a. titles, dependency for printing dpias..
 
 1. # GDPR-AVG-Register
 ai gdpr Register dpia register in English based on chat.deepseek.com/en and mysql/php
+release 8d.zip
 
 2. # Clipboard tool example registers (download) (of dutch companies, in English and in dutch language)
-first release.
+clipboard-release2.zip
 
 
 
