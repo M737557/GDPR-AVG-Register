@@ -1,5 +1,9 @@
 update 02/04/2026 clipboard tool is now saving clippys
 
+change:
+
+$data_directory
+
 Release 3
 - html
 - pdf generator (nice..)
