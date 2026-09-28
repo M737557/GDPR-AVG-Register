@@ -2,6 +2,8 @@
 <h2>Update v48 28-09-26</h2>
 <h1><strong></strong>GDPR REGISTER</h1></strong>
 
+<img src="https://i.ibb.co/5dwsDHy/re-generate2.png">
+
 <img src="https://i.ibb.co/VpHMK3SM/re-generate.png">
 <br>
 <img src="https://i.ibb.co/cXyvDjBW/edit-contract.png">
