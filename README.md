@@ -1,6 +1,6 @@
 <h3>Updates</h3><br>
 Download IS working 10-01 UTC 28-09-2026
-<h3> v49.7z |  28-09-26  | 07:26:23 UTC</h3>
+<h3> v50.7z |  28-09-26  | 13:06:40  UTC</h3>
 
 <a href="https://www.mijnavgregister.nl">online demo</a>
 <br>
