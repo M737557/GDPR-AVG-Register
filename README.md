@@ -1,5 +1,5 @@
-<h2>Update v49 28-09-26 07:26:23 UTC</h2>
-<h2>Update v48 28-09-26</h2><br>
+<p>Update v49 28-09-26 07:26:23 UTC</p>
+<p>Update v48 28-09-26</p>
 
 <H3>DIGITAL CONTRACTS SIGNING, AI CREATED- WEB SYSTEM OPENSOURCE FOR FREE FOR GOOD PEOPLE. ENJOY</H3>
 <img src="https://i.ibb.co/8grcRMXk/fr.png">
