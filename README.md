@@ -3,10 +3,11 @@
 <h1><strong></strong>GDPR REGISTER</h1></strong>
 <img src="https://i.ibb.co/8grcRMXk/fr.png">
 <img src="https://i.ibb.co/cXyvDjBW/edit-contract.png">
-<img src="https://i.ibb.co/VpHMK3SM/re-generate.png">
+
 <img src="https://i.ibb.co/5dwsDHy/re-generate2.png">
 
 <img src="https://i.ibb.co/WWPFygPd/result.png">
+<img src="https://i.ibb.co/VpHMK3SM/re-generate.png">
 
 
 
