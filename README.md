@@ -1,6 +1,6 @@
 <h2>Update v49 28-09-26 07:26:23 UTC</h2>
 <h2>Update v48 28-09-26</h2>
-<p style="color: DodgerBlue;">Worldwide Contracts</p>
+DIGITAL CONTRACTS SIGNING, AI CREATED- WEB SYSTEM OPENSOURCE FOR FREE FOR GOOD PEOPLE. ENJOY
 <img src="https://i.ibb.co/8grcRMXk/fr.png">
 <img src="https://i.ibb.co/cXyvDjBW/edit-contract.png">
 
