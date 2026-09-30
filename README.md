@@ -1,5 +1,31 @@
 <h3>Updates</h3><br>
 
+PowerShell Administrator. Run: gpedit.msc
+- gebruikersconfiguratie
+- Windows instellingen
+- scripts aanmelden/afmelden
+- Aanmelden
+- Beide .bat files hooken.
+
+
+
+versioning.bat
+versioning backup.ps1
+Versioning backup zie sourcesdir
+Versioning is per 5 seconden een backup van het bestand dat gewijzigd, verwijderd of aangemaakt word. VSS
+
+startup-fullbackup.bat
+fullbackup-vss.ps1
+(fullbackup zie sourcesdir)
+Full backup VSS.
+
+<br><br><hr>
+
+
+Add files via upload
+	
+now
+versioning.bat
 <h3> v52.7z |  29-09-26  | 10:45  UTC</h3>
 
 <a href="https://www.mijnavgregister.nl">online demo</a>
