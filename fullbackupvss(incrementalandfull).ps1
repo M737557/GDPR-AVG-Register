@@ -1,1072 +1,444 @@
+#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    VSS backup: morning FULL, midday INCREMENTAL + ARCHIVE in one run.
+    VSS backup: Full first, then Incremental + Archive (relative to the Full).
 
 .DESCRIPTION
-    Modes:
-      FULL        - Full mirror of every source to F:\fullbackup\<PC>\<Drive>\<path>.
-      INCREMENTAL - Fast pass. Uses a per-disk, per-source change manifest
-                    to only touch files whose size or LastWriteTime differ.
-      BOTH        - Runs INCREMENTAL first, then ARCHIVE. Intended for the
-                    midday run, so the changed/deleted files end up in the
-                    _changed archive without a separate evening task.
+    First run (or -ForceFull)  -> Full backup (baseline, never modified afterwards)
+    Following runs             -> Incremental + Archive
 
-    Time-window policy:
-      FULL         normally allowed only between 00:00 and 13:30.
-                   EXCEPTION: if today's FULL has not run yet, FULL is
-                   allowed at any time (catch-up run).
-      INCREMENTAL  allowed only from 14:00 onwards.
-      ARCHIVE      allowed only from 14:00 onwards.
-      BOTH         allowed only from 14:00 onwards.
-      (13:30 - 14:00 is a no-go window for every mode.)
+    Layout on the destination (derived from $DestinationDrive, e.g. F:\):
+      F:\Full\C\scripts\                              complete baseline
+      F:\Incremental\C\scripts\                       new + changed files (current version) vs. Full
+      F:\Archive\<timestamp>\Changed\C\scripts\       Full version of changed files
+      F:\Archive\<timestamp>\Deleted\C\scripts\       deleted files
+      F:\Archive\<timestamp>\manifest_<source>.csv    New/Changed/Deleted status per file
+      F:\Superseded\<timestamp>\                      old Full/Incremental after -ForceFull
+      F:\Logs\                                        transcripts and robocopy output
 
-    Archive layout (created/updated by ARCHIVE / BOTH):
-        F:\fullbackup\_changed\<PC>\
-            01-aangemaakt\<Drive>\<path>\<file>
-            02-gewijzigd\<Drive>\<path>\<file>
-            02-gewijzigd\<Drive>\<path>\<file>.vorige-versie
-            03-verwijderd\<Drive>\<path>\<file>
-            .previous\<Drive>\<path>\<file>       (internal helper)
+    All data is read from a VSS snapshot (consistent, works with open files).
+    Progress bars are shown for scanning, copying and archiving.
 
-    - VSS snapshot per source volume, so locked/open files copy fine.
-    - One physical disk per day of the month (01..31), rotated by hand.
-    - Versioning = true mirror (overwrite + delete) in the SAME destination
-      folder structure, PLUS the _changed archive.
-    - Pure PowerShell copy engine. No robocopy.
+.PARAMETER ForceFull
+    Force a new Full. The old Full + Incremental are moved to Superseded\<timestamp>\.
 
-    Manifests live on the backup disk:
-        F:\fullbackup\.state\<PC>\<Drive>_<safe-source>.tsv
-        F:\fullbackup\.state\<PC>\_changed_<Drive>_<safe-source>.tsv
-
-    FULL-done marker (per day, per PC, on backup disk):
-        F:\fullbackup\.state\<PC>\full-done_<yyyy-MM-dd>.marker
-
-.NOTES
-    Run as Administrator. F: must be NTFS.
-
-    Typical daily schedule:
-        07:00   .\backup.ps1 -Mode FULL
-        13:00   .\backup.ps1 -Mode BOTH
+.PARAMETER ArchiveRetentionDays
+    Delete Archive folders older than N days. 0 = never clean up (default).
 #>
-
 [CmdletBinding()]
 param(
-    [ValidateSet('FULL','INCREMENTAL','ARCHIVE','BOTH')]
-    [string]$Mode = 'FULL'
+    [switch]$ForceFull,
+    [int]$ArchiveRetentionDays = 0
 )
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-$SourceDirs = @(
-    "C:\xampp3\htdocs"
-    "C:\users\maev"
-    "C:\scripts"
-    "C:\windows10\pri\Mijnbestanden"
-)
-
-$DestinationBase  = "F:\fullbackup"
-$DestinationDrive = "F"
-
-$IncludeComputerName = $true
-
-$MirrorDeletes = $true
-
-# Monthly rotation: 31 disks, one per day of the month.
-$VerifyDiskLabel = $false
-$ExpectedVolumeLabelFormat = "BK-DAY-{0:D2}"
-
-$CopyRetries = 3
-$CopyRetryWaitSec = 5
-
-$ExcludeDirs  = @('$RECYCLE.BIN', 'System Volume Information')
-$ExcludeFiles = @('pagefile.sys', 'hiberfil.sys', 'swapfile.sys')
-
-$LogDir = "C:\BackupLogs"
-
-$UseUnicodeProgressBar = $true
-
-# --- Names of the three subfolders of the _changed archive ---
-$ChangedRootName     = "_changed"
-$ChangedCreatedName  = "01-aangemaakt"
-$ChangedModifiedName = "02-gewijzigd"
-$ChangedDeletedName  = "03-verwijderd"
-
-# --- Time-window policy ---
-# FULL is allowed only between 00:00 and 13:30.
-# INCREMENTAL / ARCHIVE / BOTH are allowed only from 14:00 onwards.
-# (13:30 - 14:00 is a no-go window.)
-$FullBackupCutoff    = [TimeSpan]::FromHours(13) + [TimeSpan]::FromMinutes(30)  # 13:30
-$IncrementalEarliest = [TimeSpan]::FromHours(14)                                 # 14:00
-
-# Allow FULL outside its normal time window if no FULL has run yet today.
-# A per-day marker file is written on the destination after a successful FULL.
-$AllowFullIfNotYetRunToday = $true
-
-# ============================================================
 
 $ErrorActionPreference = 'Stop'
 
-# --- Admin check ---
-$isAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { Write-Host "ERROR: Run as Administrator." -ForegroundColor Red; exit 1 }
+# ----------------------------- Configuration -----------------------------
+$SourceDirs = @(
+    "C:\xampp3\htdocs"
+    #"C:\users\maev"
+    "C:\scripts"
+    #"C:\windows10\pri\Mijnbestanden"
+)
 
-# --- Logging ---
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-$RunStamp = "{0:yyyy-MM-dd_HH-mm-ss}" -f (Get-Date)
-$LogFile  = Join-Path $LogDir ("VssBackup_{0}_{1}.log" -f $Mode, $RunStamp)
+$DestinationDrive = "F"                              # the only destination setting
+$DestinationBase  = "${DestinationDrive}:\"          # destination is the root of the drive: F:\
 
-$script:LogWriter = New-Object IO.StreamWriter($LogFile, $true, (New-Object Text.UTF8Encoding($false)))
-$script:ProgressActive = $false
+# Everything else is derived from the destination, nothing is hard-coded
+$FullRoot   = Join-Path $DestinationBase 'Full'
+$IncRoot    = Join-Path $DestinationBase 'Incremental'
+$ArchRoot   = Join-Path $DestinationBase 'Archive'
+$SuperRoot  = Join-Path $DestinationBase 'Superseded'
+$LogRoot    = Join-Path $DestinationBase 'Logs'
+$VssLinkFmt = Join-Path $env:TEMP 'vss_link_{0}'     # {0} = source drive letter
 
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    if ($script:LogWriter) { $script:LogWriter.WriteLine($line); $script:LogWriter.Flush() }
-    if (-not $script:ProgressActive) {
-        Write-Host $line
-    } else {
-        [Console]::WriteLine($line)
-    }
-}
-function Close-Log {
-    if ($script:LogWriter) { try { $script:LogWriter.Dispose() } catch {}; $script:LogWriter = $null }
-}
+# Folders to exclude (original paths, not snapshot paths). Excluded folders are skipped
+# in Full, Incremental and Archive, and are ignored in the Full-vs-source comparison.
+$ExcludeDirs = @(
+    "C:\users\maev\appdata"
+)
+# -------------------------------------------------------------------------
 
-function Format-Size {
-    param([int64]$Bytes)
-    if ($Bytes -ge 1TB) { return "{0:N2} TB" -f ($Bytes / 1TB) }
-    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
-    if ($Bytes -ge 1MB) { return "{0:N2} MB" -f ($Bytes / 1MB) }
-    if ($Bytes -ge 1KB) { return "{0:N2} KB" -f ($Bytes / 1KB) }
-    return "$Bytes B"
-}
-function Format-Duration {
-    param([double]$Seconds)
-    if ($Seconds -lt 60) { return ("{0:n0}s" -f $Seconds) }
-    $ts = [TimeSpan]::FromSeconds($Seconds)
-    if ($ts.TotalHours -ge 1) { return ("{0}h{1:d2}m{2:d2}s" -f [int]$ts.TotalHours, $ts.Minutes, $ts.Seconds) }
-    return ("{0}m{1:d2}s" -f $ts.Minutes, $ts.Seconds)
-}
+$Timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ArchiveRun = Join-Path $ArchRoot $Timestamp
 
-function To-LongPath {
-    param([string]$Path)
-    if ($Path.StartsWith('\\?\')) { return $Path }
-    if ($Path.StartsWith('\\'))    { return '\\?\UNC\' + $Path.Substring(2) }
-    return '\\?\' + $Path
-}
+# ------------------------------ Progress ---------------------------------
 
-# ============================================================
-# FULL-DONE MARKER (per day, per PC, on backup disk)
-# ============================================================
-
-function Get-FullDoneMarkerPath {
-    # One marker per calendar day, per PC, on the backup disk.
-    $markerDir = Join-Path (Join-Path $DestinationBase ".state") $env:COMPUTERNAME
-    return (Join-Path $markerDir ("full-done_{0:yyyy-MM-dd}.marker" -f (Get-Date)))
-}
-
-function Test-FullAlreadyDoneToday {
-    $p = Get-FullDoneMarkerPath
-    return (Test-Path -LiteralPath $p)
-}
-
-function Set-FullDoneMarker {
-    $p = Get-FullDoneMarkerPath
-    $dir = Split-Path -Parent $p
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-    Set-Content -LiteralPath $p -Value ((Get-Date).ToString("s")) -Encoding UTF8
-}
-
-function Test-ModeAllowedNow {
-    param([string]$RequestedMode)
-
-    $now = (Get-Date).TimeOfDay
-
-    # "FULL" mode: allowed from 00:00 up to and including 13:30,
-    # OR at any time if today's FULL has not run yet (catch-up).
-    if ($RequestedMode -eq 'FULL') {
-        if ($now -le $FullBackupCutoff) {
-            return @{ Allowed = $true }
-        }
-        if ($AllowFullIfNotYetRunToday -and -not (Test-FullAlreadyDoneToday)) {
-            return @{
-                Allowed = $true
-                Reason  = ("FULL allowed outside window: no FULL has run yet today ({0:yyyy-MM-dd})." -f (Get-Date))
-            }
-        }
-        return @{
-            Allowed = $false
-            Reason  = ("FULL is not allowed at this time ({0:HH:mm}). Allowed window: 00:00 - 13:30, and today's FULL is already done." -f (Get-Date))
-        }
-    }
-
-    # INCREMENTAL / ARCHIVE / BOTH: allowed from 14:00 onwards.
-    if ($RequestedMode -in 'INCREMENTAL','ARCHIVE','BOTH') {
-        if ($now -ge $IncrementalEarliest) {
-            return @{ Allowed = $true }
-        }
-        return @{
-            Allowed = $false
-            Reason  = ("{0} is not allowed at this time ({1:HH:mm}). Allowed window: from 14:00 onwards." -f $RequestedMode, (Get-Date))
-        }
-    }
-
-    return @{ Allowed = $false; Reason = "Unknown mode: $RequestedMode" }
-}
-
-# ============================================================
-# PROGRESS
-# ============================================================
-
-function New-BarString {
-    param([char]$Char, [int]$Count)
-    if ($Count -le 0) { return '' }
-    return [string]::new($Char, $Count)
-}
+$script:Sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Show-Progress {
     param(
-        [string]$Label,
-        [int]$Current,
-        [int]$Total,
-        [int64]$BytesDone,
-        [int64]$BytesTotal,
-        [datetime]$StartTime
+        [int]$Id, [string]$Activity, [string]$Status,
+        [int]$Percent = -1, [int]$ParentId = -1, [switch]$Force
     )
-    $script:ProgressActive = $true
+    # Throttle updates so the console does not slow the copy down
+    if (-not $Force -and $script:Sw.ElapsedMilliseconds -lt 150) { return }
+    $script:Sw.Restart()
+    $p = @{ Id = $Id; Activity = $Activity; Status = $Status }
+    if ($Percent -ge 0) { $p.PercentComplete = [math]::Min(100, $Percent) }
+    if ($ParentId -ge 0) { $p.ParentId = $ParentId }
+    Write-Progress @p
+}
 
-    $pct = if ($Total -gt 0) { [int](100.0 * $Current / $Total) } else { 0 }
-    if ($pct -gt 100) { $pct = 100 }
+function Stop-Progress([int]$Id) {
+    Write-Progress -Id $Id -Activity 'done' -Completed
+}
 
-    $elapsed = ((Get-Date) - $StartTime).TotalSeconds
-    $speed = if ($elapsed -gt 0) { $BytesDone / $elapsed } else { 0 }
-    $eta   = if ($speed -gt 0 -and $BytesTotal -gt $BytesDone) {
-                ($BytesTotal - $BytesDone) / $speed
-             } else { 0 }
+function Format-Size([double]$Bytes) {
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    return ('{0:N0} KB' -f ($Bytes / 1KB))
+}
 
-    $consoleWidth = 100
-    try { $consoleWidth = [Math]::Max(60, [Console]::WindowWidth - 1) } catch {}
-    $barWidth = 30
-    $filled   = [int][Math]::Floor($barWidth * $pct / 100)
-    $empty    = $barWidth - $filled
+# ------------------------------ Functions --------------------------------
 
-    if ($UseUnicodeProgressBar) {
-        $bar = (New-BarString -Char ([char]0x2588) -Count $filled) + `
-               (New-BarString -Char ([char]0x2591) -Count $empty)
-    } else {
-        $bar = (New-BarString -Char ([char]'#')      -Count $filled) + `
-               (New-BarString -Char ([char]'.')      -Count $empty)
+function Get-BackupName([string]$Path) {
+    # C:\users\maev -> C_users_maev
+    return ($Path -replace '[:\\\/]+', '_').Trim('_')
+}
+
+function Get-HardPathName([string]$Path) {
+    # C:\scripts -> C\scripts (a colon is not allowed in a folder name)
+    return ($Path -replace '^([A-Za-z]):', '$1').Trim('\')
+}
+
+function New-VssSnapshot([string]$VolumeRoot) {
+    Write-Host "Creating VSS snapshot of $VolumeRoot ..."
+    $res = ([WMICLASS]"root\cimv2:Win32_ShadowCopy").Create($VolumeRoot, "ClientAccessible")
+    if ($res.ReturnValue -ne 0) {
+        throw "VSS snapshot failed for $VolumeRoot (ReturnValue $($res.ReturnValue))"
     }
+    $shadow = Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $res.ShadowID }
 
-    $line = "{0,-22} [{1}] {2,3}%  {3,6}/{4,-6} files  {5,10} / {6,-10}  {7,9}/s  ETA {8}" -f `
-        $Label, $bar, $pct, $Current, $Total, `
-        (Format-Size $BytesDone), (Format-Size $BytesTotal), `
-        (Format-Size ([int64]$speed)), (Format-Duration $eta)
-
-    if ($line.Length -gt $consoleWidth) { $line = $line.Substring(0, $consoleWidth) } else { $line = $line.PadRight($consoleWidth) }
-
-    [Console]::Write("`r" + $line)
-}
-
-function Clear-Progress {
-    if (-not $script:ProgressActive) { return }
-    $consoleWidth = 100
-    try { $consoleWidth = [Math]::Max(60, [Console]::WindowWidth - 1) } catch {}
-    [Console]::Write("`r" + (' ' * $consoleWidth) + "`r")
-    $script:ProgressActive = $false
-}
-
-# ============================================================
-# VSS
-# ============================================================
-
-$VssErrorText = @{
-    1="Access denied"; 2="Invalid argument"; 3="Volume not found"; 4="Volume not supported"
-    5="Unsupported context"; 6="Insufficient storage"; 7="Volume in use"
-    8="Max shadow copies reached"; 9="Another shadow copy operation in progress"
-    10="Provider vetoed"; 11="Provider not registered"; 12="Provider failure"; 13="Unknown error"
-}
-
-function New-VssSnapshot {
-    param([string]$Volume, [int]$MaxAttempts = 20, [int]$DelaySeconds = 30)
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        $result = (Get-WmiObject -List Win32_ShadowCopy).Create($Volume, "ClientAccessible")
-        $code = [int]$result.ReturnValue
-        if ($code -eq 0) { return $result.ShadowID }
-        $text = $VssErrorText[$code]
-        if ($code -in 9,12 -and $attempt -lt $MaxAttempts) {
-            Write-Log ("VSS busy for {0}: {1} ({2}). Retry {3}/{4} in {5}s..." -f `
-                $Volume, $code, $text, $attempt, ($MaxAttempts-1), $DelaySeconds) "WARN"
-            Start-Sleep -Seconds $DelaySeconds; continue
-        }
-        throw "Shadow copy create failed: code $code ($text)"
+    $link = $VssLinkFmt -f $VolumeRoot.Substring(0, 1)
+    if (Test-Path -LiteralPath $link) {
+        # leftover from a crashed run: rmdir only removes the link, not the content
+        & cmd.exe /c "rmdir `"$link`"" | Out-Null
     }
+    $device = $shadow.DeviceObject + '\'
+    $out = & cmd.exe /c "mklink /d `"$link`" `"$device`"" 2>&1
+    if (-not (Test-Path -LiteralPath $link)) { throw "Creating symlink to snapshot failed: $out" }
+    return [pscustomobject]@{ Shadow = $shadow; Link = $link; Volume = $VolumeRoot }
 }
 
-function Remove-DirLink {
-    param([string]$Path)
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if (-not $item) { return }
-    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "$Path exists and is NOT a symlink - refusing to touch it."
-    }
-    cmd.exe /c rmdir "$Path" | Out-Null
-}
-
-# ============================================================
-# SETUP
-# ============================================================
-
-$today       = Get-Date
-$dayOfMonth  = $today.Day
-$expectedLbl = $ExpectedVolumeLabelFormat -f $dayOfMonth
-
-$DestinationRoot = $DestinationBase
-if ($IncludeComputerName) { $DestinationRoot = Join-Path $DestinationRoot $env:COMPUTERNAME }
-
-$ChangedRoot = Join-Path $DestinationBase $ChangedRootName
-if ($IncludeComputerName) { $ChangedRoot = Join-Path $ChangedRoot $env:COMPUTERNAME }
-
-$StateRoot = Join-Path $DestinationBase ".state"
-if ($IncludeComputerName) { $StateRoot = Join-Path $StateRoot $env:COMPUTERNAME }
-
-Write-Log "=== VSS backup started: Mode=$Mode ==="
-Write-Log ("Today is {0:yyyy-MM-dd} ({1}), month-day = {2:D2}" -f $today, $today.DayOfWeek, $dayOfMonth)
-Write-Log "Destination root: $DestinationRoot"
-Write-Log "Changed root:     $ChangedRoot"
-Write-Log "State root:       $StateRoot"
-
-if (-not (Test-Path "${DestinationDrive}:\")) {
-    Write-Log "Destination drive ${DestinationDrive}: not available." "ERROR"
-    Write-Log "=== Backup ended (FAILED) ==="; Close-Log; exit 1
-}
-
-$vol = Get-Volume -DriveLetter $DestinationDrive -ErrorAction SilentlyContinue
-if ($vol.FileSystemType -and $vol.FileSystemType -ne 'NTFS') {
-    Write-Log "WARNING: ${DestinationDrive}: is $($vol.FileSystemType), not NTFS." "WARN"
-}
-
-if ($VerifyDiskLabel) {
-    if ($vol.FileSystemLabel -ne $expectedLbl) {
-        Write-Log ("ERROR: Disk label mismatch. Expected '{0}', found '{1}'." -f `
-            $expectedLbl, $vol.FileSystemLabel) "ERROR"
-        Write-Log "=== Backup ended (FAILED) ==="; Close-Log; exit 1
-    }
-    Write-Log "Disk label check OK: $($vol.FileSystemLabel)"
-}
-
-foreach ($p in @($DestinationRoot, $ChangedRoot, $StateRoot)) {
-    if (-not (Test-Path -LiteralPath $p)) {
-        New-Item -ItemType Directory -Path $p -Force | Out-Null
-    }
-}
-
-# --- Validate sources ---
-$validSources = @()
-foreach ($src in $SourceDirs) {
-    if (Test-Path -LiteralPath $src) {
-        $validSources += (Resolve-Path -LiteralPath $src).Path.TrimEnd('\')
-    } else {
-        Write-Log "Source not found, skipping: $src" "WARN"
-    }
-}
-if ($validSources.Count -eq 0) { Write-Log "No valid sources. Aborting." "ERROR"; Close-Log; exit 1 }
-
-# ============================================================
-# MANIFEST HANDLING
-# ============================================================
-
-function Load-Manifest {
-    param([string]$Path)
-    $dict = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
-    if (-not (Test-Path -LiteralPath $Path)) { return $dict }
+function Remove-VssSnapshot($Snap) {
     try {
-        $reader = New-Object IO.StreamReader($Path, [Text.Encoding]::UTF8)
-        try {
-            while (-not $reader.EndOfStream) {
-                $line = $reader.ReadLine()
-                if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                $parts = $line -split "`t"
-                if ($parts.Count -lt 3) { continue }
-                $dict[$parts[0]] = [pscustomobject]@{
-                    Size  = [int64]$parts[1]
-                    Ticks = [int64]$parts[2]
-                }
-            }
-        } finally { $reader.Dispose() }
-    } catch {
-        Write-Log "Could not read manifest $Path : $_" "WARN"
-    }
-    return $dict
-}
-
-function Save-Manifest {
-    param([string]$Path, $Entries)
-    $tmp = "$Path.tmp"
-    $writer = New-Object IO.StreamWriter($tmp, $false, (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $Snap.Link) {
+            & cmd.exe /c "rmdir `"$($Snap.Link)`"" | Out-Null
+        }
+    } catch { Write-Warning "Removing link failed: $_" }
     try {
-        foreach ($kv in $Entries.GetEnumerator()) {
-            $writer.Write($kv.Key); $writer.Write("`t")
-            $writer.Write($kv.Value.Size); $writer.Write("`t")
-            $writer.Write($kv.Value.Ticks); $writer.WriteLine()
-        }
-    } finally { $writer.Dispose() }
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+        $Snap.Shadow | Remove-CimInstance
+        Write-Host "VSS snapshot of $($Snap.Volume) removed."
+    } catch { Write-Warning "Removing snapshot failed: $_" }
 }
 
-# ============================================================
-# COPY ENGINE
-# ============================================================
-
-function Test-Excluded {
-    param([string]$Name, [string[]]$Patterns)
-    foreach ($p in $Patterns) { if ($Name -ieq $p) { return $true } }
-    return $false
-}
-
-function Copy-OneItem {
-    param([string]$SourcePath, [string]$DestPath)
-    $destDir = Split-Path -Parent $DestPath
-    if (-not (Test-Path -LiteralPath (To-LongPath $destDir))) {
-        New-Item -ItemType Directory -Path (To-LongPath $destDir) -Force | Out-Null
-    }
-    for ($a = 1; $a -le $CopyRetries; $a++) {
-        try {
-            Copy-Item -LiteralPath (To-LongPath $SourcePath) -Destination (To-LongPath $DestPath) -Force -ErrorAction Stop
-            $srcItem = Get-Item -LiteralPath (To-LongPath $SourcePath) -Force
-            $dstItem = Get-Item -LiteralPath (To-LongPath $DestPath)   -Force
-            if ($dstItem.LastWriteTime -ne $srcItem.LastWriteTime) { $dstItem.LastWriteTime = $srcItem.LastWriteTime }
-            if ($dstItem.CreationTime  -ne $srcItem.CreationTime)  { $dstItem.CreationTime  = $srcItem.CreationTime  }
-            return $true
-        } catch {
-            if ($a -lt $CopyRetries) {
-                Write-Log ("Retry {0}/{1} for {2}: {3}" -f $a, $CopyRetries, $SourcePath, $_.Exception.Message) "WARN"
-                Start-Sleep -Seconds $CopyRetryWaitSec
-            } else {
-                Write-Log ("FAILED to copy {0} -> {1}: {2}" -f $SourcePath, $DestPath, $_.Exception.Message) "ERROR"
-                return $false
-            }
+function Get-RelativeExcludes([string]$OriginalSrc) {
+    # Converts the absolute exclude paths into paths relative to this source,
+    # e.g. source C:\users\maev + exclude C:\users\maev\appdata -> "appdata"
+    $base = $OriginalSrc.TrimEnd('\') + '\'
+    $out = @()
+    foreach ($e in $ExcludeDirs) {
+        $x = $e.TrimEnd('\')
+        if ((($x + '\').StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) -and ($x.Length -ge $base.Length)) {
+            $out += $x.Substring($base.Length)
         }
     }
+    return $out    # callers wrap the result in @() so 0 or 1 items still become an array
 }
 
-function Get-SourceTree {
-    param([string]$SourceRoot, [string[]]$ExcludeDirs, [string[]]$ExcludeFiles)
-    $srcFiles = @(); $srcDirs = @()
-    $stack = New-Object System.Collections.Stack
-    $stack.Push($SourceRoot)
+function Get-FileMap([string]$Root, [string]$Label, [int]$ParentId, [string[]]$ExcludeRel = @()) {
+    # relative path -> FileInfo (hashtable is case-insensitive by default)
+    # Excluded folders (and junctions/symlinks) are pruned, never enumerated.
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $Root)) { return $map }
+    $rootTrim = $Root.TrimEnd('\')
+    $len = $rootTrim.Length + 1
+    $excl = @($ExcludeRel | ForEach-Object { (Join-Path $rootTrim $_).TrimEnd('\') })
+
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($rootTrim)
+    $n = 0
     while ($stack.Count -gt 0) {
-        $current = $stack.Pop()
-        try { $entries = Get-ChildItem -LiteralPath (To-LongPath $current) -Force -ErrorAction Stop }
-        catch {
-            Write-Log ("Cannot enumerate {0}: {1}" -f $current, $_.Exception.Message) "WARN"
-            continue
+        $di = New-Object System.IO.DirectoryInfo($stack.Pop())
+        try { $subs = $di.GetDirectories() } catch { $subs = @() }
+        foreach ($s in $subs) {
+            if ($s.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }  # same as robocopy /XJ
+            if ($excl -contains $s.FullName.TrimEnd('\')) { continue }                       # excluded folder
+            $stack.Push($s.FullName)
         }
-        foreach ($e in $entries) {
-            if ($e.PSIsContainer) {
-                if (Test-Excluded $e.Name $ExcludeDirs) { continue }
-                $srcDirs += $e; $stack.Push($e.FullName)
-            } else {
-                if (Test-Excluded $e.Name $ExcludeFiles) { continue }
-                $srcFiles += $e
+        try { $files = $di.GetFiles() } catch { $files = @() }
+        foreach ($f in $files) {
+            $map[$f.FullName.Substring($len)] = $f
+            $n++
+            if (($n % 200) -eq 0) {
+                Show-Progress -Id 3 -ParentId $ParentId -Activity "Scanning $Label" -Status "$n files found"
             }
         }
     }
-    return @{ Files = $srcFiles; Dirs = $srcDirs }
+    Stop-Progress 3
+    return $map
 }
 
-# ------------------------------------------------------------
-# FULL
-# ------------------------------------------------------------
-function Sync-Tree-Full {
-    param(
-        [string]$SourceRoot, [string]$DestRoot,
-        [string[]]$ExcludeDirs, [string[]]$ExcludeFiles,
-        [bool]$MirrorDeletes, [string]$ProgressLabel,
-        [string]$ManifestPath
-    )
-    $stats = [ordered]@{ Copied=0; Updated=0; Skipped=0; Deleted=0; Errors=0; Bytes=[int64]0 }
-    if (-not (Test-Path -LiteralPath (To-LongPath $DestRoot))) {
-        New-Item -ItemType Directory -Path (To-LongPath $DestRoot) -Force | Out-Null
-    }
+function Test-FileChanged($A, $B) {
+    if ($A.Length -ne $B.Length) { return $true }
+    # 2 second tolerance because of timestamp rounding
+    return ([math]::Abs(($A.LastWriteTimeUtc - $B.LastWriteTimeUtc).TotalSeconds) -gt 2)
+}
 
-    Show-Progress -Label "$ProgressLabel [scan]" -Current 0 -Total 0 -BytesDone 0 -BytesTotal 0 -StartTime (Get-Date)
-    $tree = Get-SourceTree -SourceRoot $SourceRoot -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
-    $srcFiles = $tree.Files; $srcDirs = $tree.Dirs
+function Copy-FileSafe([string]$From, [string]$To) {
+    $dir = Split-Path -Parent $To
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if (Test-Path -LiteralPath $To) { (Get-Item -LiteralPath $To -Force).Attributes = 'Normal' }
+    [System.IO.File]::Copy($From, $To, $true)   # preserves LastWriteTime
+}
 
-    $totalFiles = $srcFiles.Count
-    $totalBytes = [int64]0
-    foreach ($f in $srcFiles) { $totalBytes += [int64]$f.Length }
-    Write-Log ("Scan complete: {0} files, {1} dirs, {2}" -f $totalFiles, $srcDirs.Count, (Format-Size $totalBytes))
-
-    $srcRootLong = (To-LongPath $SourceRoot).TrimEnd('\')
-    $srcRelFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $srcRelDirs  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($f in $srcFiles) { [void]$srcRelFiles.Add($f.FullName.Substring($srcRootLong.Length).TrimStart('\')) }
-    foreach ($d in $srcDirs)  { [void]$srcRelDirs.Add($d.FullName.Substring($srcRootLong.Length).TrimStart('\')) }
-
-    $startTime  = Get-Date
-    $doneFiles  = 0
-    $doneBytes  = [int64]0
-    $lastUpdate = Get-Date
-    $newEntries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($f in $srcFiles) {
-        $rel     = $f.FullName.Substring($srcRootLong.Length).TrimStart('\')
-        $dst     = Join-Path $DestRoot $rel
-        $dstLong = To-LongPath $dst
-
-        $needsCopy = $true
-        if (Test-Path -LiteralPath $dstLong) {
-            try {
-                $dstItem = Get-Item -LiteralPath $dstLong -Force
-                if ($dstItem.Length -eq $f.Length -and $dstItem.LastWriteTime -eq $f.LastWriteTime) {
-                    $needsCopy = $false; $stats.Skipped++
-                } else { $stats.Updated++ }
-            } catch { $stats.Updated++ }
-        } else { $stats.Copied++ }
-
-        if ($needsCopy) {
-            if (Copy-OneItem -SourcePath $f.FullName -DestPath $dst) {
-                $stats.Bytes += [int64]$f.Length
-                $doneBytes   += [int64]$f.Length
-            } else { $stats.Errors++ }
-        }
+function Copy-WithProgress {
+    # $Items: array of @{ From=...; To=...; Size=... }
+    param($Items, [string]$Activity, [int]$ParentId)
+    # Items are hashtables, so Measure-Object -Property would not work; sum manually
+    $totalBytes = [long]0
+    foreach ($it in $Items) { $totalBytes += [long]$it.Size }
+    if ($totalBytes -le 0) { $totalBytes = 1 }
+    $doneBytes = 0; $doneFiles = 0; $totalFiles = $Items.Count
+    foreach ($it in $Items) {
+        Copy-FileSafe $it.From $it.To
+        $doneBytes += $it.Size
         $doneFiles++
-
-        $newEntries[$rel] = [pscustomobject]@{ Size = [int64]$f.Length; Ticks = $f.LastWriteTime.Ticks }
-
-        $now = Get-Date
-        if (($now - $lastUpdate).TotalMilliseconds -ge 100) {
-            Show-Progress -Label $ProgressLabel -Current $doneFiles -Total $totalFiles `
-                          -BytesDone $doneBytes -BytesTotal $totalBytes -StartTime $startTime
-            $lastUpdate = $now
-        }
+        $pct = [int](($doneBytes / $totalBytes) * 100)
+        Show-Progress -Id 2 -ParentId $ParentId -Activity $Activity `
+            -Status ("{0}/{1} files - {2} of {3}" -f $doneFiles, $totalFiles, (Format-Size $doneBytes), (Format-Size $totalBytes)) `
+            -Percent $pct
     }
-    Show-Progress -Label $ProgressLabel -Current $doneFiles -Total $totalFiles `
-                  -BytesDone $doneBytes -BytesTotal $totalBytes -StartTime $startTime
-
-    if ($MirrorDeletes) {
-        Clear-Progress
-        Write-Log "Scanning destination for deletions..." "DEBUG"
-        $destRootLong = (To-LongPath $DestRoot).TrimEnd('\')
-        $dstAllFiles = @(); $dstAllDirs = @()
-        $stack2 = New-Object System.Collections.Stack
-        $stack2.Push($DestRoot)
-        while ($stack2.Count -gt 0) {
-            $current = $stack2.Pop()
-            try { $entries = Get-ChildItem -LiteralPath (To-LongPath $current) -Force -ErrorAction Stop } catch { continue }
-            foreach ($e in $entries) {
-                if ($e.PSIsContainer) {
-                    if (Test-Excluded $e.Name $ExcludeDirs) { continue }
-                    $dstAllDirs += $e; $stack2.Push($e.FullName)
-                } else {
-                    if (Test-Excluded $e.Name $ExcludeFiles) { continue }
-                    $dstAllFiles += $e
-                }
-            }
-        }
-        $totalDel = $dstAllFiles.Count
-        $i = 0; $startDel = Get-Date
-        foreach ($df in $dstAllFiles) {
-            $rel = $df.FullName.Substring($destRootLong.Length).TrimStart('\')
-            if (-not $srcRelFiles.Contains($rel)) {
-                try {
-                    Remove-Item -LiteralPath (To-LongPath $df.FullName) -Force -ErrorAction Stop
-                    $stats.Deleted++
-                    [void]$newEntries.Remove($rel)
-                    Write-Log ("Deleted file: $($df.FullName)") "DEBUG"
-                } catch {
-                    Write-Log ("Failed to delete {0}: {1}" -f $df.FullName, $_.Exception.Message) "WARN"
-                    $stats.Errors++
-                }
-            }
-            $i++
-            $now = Get-Date
-            if (($now - $startDel).TotalMilliseconds -ge 100) {
-                Show-Progress -Label "$ProgressLabel [delete]" -Current $i -Total $totalDel `
-                              -BytesDone 0 -BytesTotal 0 -StartTime $startDel
-                $startDel = $now
-            }
-        }
-        $sortedDirs = $dstAllDirs | Sort-Object { $_.FullName.Length } -Descending
-        foreach ($dd in $sortedDirs) {
-            $rel = $dd.FullName.Substring($destRootLong.Length).TrimStart('\')
-            if (-not $srcRelDirs.Contains($rel)) {
-                try {
-                    Remove-Item -LiteralPath (To-LongPath $dd.FullName) -Force -Recurse -ErrorAction Stop
-                    $stats.Deleted++
-                } catch {}
-            }
-        }
-        Clear-Progress
-    }
-
-    Save-Manifest -Path $ManifestPath -Entries $newEntries
-    Clear-Progress
-    return $stats
+    Stop-Progress 2
 }
 
-# ------------------------------------------------------------
-# INCREMENTAL
-# ------------------------------------------------------------
-function Sync-Tree-Incremental {
-    param(
-        [string]$SourceRoot, [string]$DestRoot,
-        [string[]]$ExcludeDirs, [string[]]$ExcludeFiles,
-        [bool]$MirrorDeletes, [string]$ProgressLabel,
-        [string]$ManifestPath
-    )
-    $stats = [ordered]@{ Copied=0; Updated=0; Skipped=0; Deleted=0; Errors=0; Bytes=[int64]0 }
-
-    $manifest = Load-Manifest -Path $ManifestPath
-    Write-Log ("Loaded manifest: {0} entries from {1}" -f $manifest.Count, $ManifestPath)
-
-    Show-Progress -Label "$ProgressLabel [scan]" -Current 0 -Total 0 -BytesDone 0 -BytesTotal 0 -StartTime (Get-Date)
-    $tree = Get-SourceTree -SourceRoot $SourceRoot -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
-    $srcFiles = $tree.Files; $srcDirs = $tree.Dirs
-
-    $totalFiles = $srcFiles.Count
-    $totalBytes = [int64]0
-    foreach ($f in $srcFiles) { $totalBytes += [int64]$f.Length }
-    Write-Log ("Scan complete: {0} files, {1} dirs, {2}" -f $totalFiles, $srcDirs.Count, (Format-Size $totalBytes))
-
-    $srcRootLong = (To-LongPath $SourceRoot).TrimEnd('\')
-    $srcRelFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $srcRelDirs  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($f in $srcFiles) { [void]$srcRelFiles.Add($f.FullName.Substring($srcRootLong.Length).TrimStart('\')) }
-    foreach ($d in $srcDirs)  { [void]$srcRelDirs.Add($d.FullName.Substring($srcRootLong.Length).TrimStart('\')) }
-
-    $startTime  = Get-Date
-    $doneFiles  = 0
-    $doneBytes  = [int64]0
-    $lastUpdate = Get-Date
-    $newEntries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
-
-    foreach ($f in $srcFiles) {
-        $rel     = $f.FullName.Substring($srcRootLong.Length).TrimStart('\')
-        $dst     = Join-Path $DestRoot $rel
-        $dstLong = To-LongPath $dst
-        $srcTicks = $f.LastWriteTime.Ticks
-        $srcSize  = [int64]$f.Length
-
-        $manifestHit = $false
-        if ($manifest.ContainsKey($rel)) {
-            $m = $manifest[$rel]
-            if ($m.Size -eq $srcSize -and $m.Ticks -eq $srcTicks) { $manifestHit = $true }
-        }
-        $needsCopy = -not $manifestHit
-        if ($manifestHit) {
-            if (-not (Test-Path -LiteralPath $dstLong)) { $needsCopy = $true }
-            else { $stats.Skipped++ }
-        }
-
-        if ($needsCopy) {
-            $exists = Test-Path -LiteralPath $dstLong
-            if ($exists) { $stats.Updated++ } else { $stats.Copied++ }
-            if (Copy-OneItem -SourcePath $f.FullName -DestPath $dst) {
-                $stats.Bytes += $srcSize; $doneBytes += $srcSize
-            } else { $stats.Errors++ }
-        }
-        $doneFiles++
-        $newEntries[$rel] = [pscustomobject]@{ Size = $srcSize; Ticks = $srcTicks }
-
-        $now = Get-Date
-        if (($now - $lastUpdate).TotalMilliseconds -ge 100) {
-            Show-Progress -Label $ProgressLabel -Current $doneFiles -Total $totalFiles `
-                          -BytesDone $doneBytes -BytesTotal $totalBytes -StartTime $startTime
-            $lastUpdate = $now
-        }
-    }
-    Show-Progress -Label $ProgressLabel -Current $doneFiles -Total $totalFiles `
-                  -BytesDone $doneBytes -BytesTotal $totalBytes -StartTime $startTime
-
-    if ($MirrorDeletes) {
-        Clear-Progress
-        Write-Log "Scanning destination for deletions..." "DEBUG"
-        $destRootLong = (To-LongPath $DestRoot).TrimEnd('\')
-        $dstAllFiles = @(); $dstAllDirs = @()
-        $stack2 = New-Object System.Collections.Stack
-        $stack2.Push($DestRoot)
-        while ($stack2.Count -gt 0) {
-            $current = $stack2.Pop()
-            try { $entries = Get-ChildItem -LiteralPath (To-LongPath $current) -Force -ErrorAction Stop } catch { continue }
-            foreach ($e in $entries) {
-                if ($e.PSIsContainer) {
-                    if (Test-Excluded $e.Name $ExcludeDirs) { continue }
-                    $dstAllDirs += $e; $stack2.Push($e.FullName)
-                } else {
-                    if (Test-Excluded $e.Name $ExcludeFiles) { continue }
-                    $dstAllFiles += $e
-                }
-            }
-        }
-        $totalDel = $dstAllFiles.Count
-        $i = 0; $startDel = Get-Date
-        foreach ($df in $dstAllFiles) {
-            $rel = $df.FullName.Substring($destRootLong.Length).TrimStart('\')
-            if (-not $srcRelFiles.Contains($rel)) {
-                try {
-                    Remove-Item -LiteralPath (To-LongPath $df.FullName) -Force -ErrorAction Stop
-                    $stats.Deleted++
-                    [void]$newEntries.Remove($rel)
-                    Write-Log ("Deleted file: $($df.FullName)") "DEBUG"
-                } catch {
-                    Write-Log ("Failed to delete {0}: {1}" -f $df.FullName, $_.Exception.Message) "WARN"
-                    $stats.Errors++
-                }
-            }
-            $i++
-            $now = Get-Date
-            if (($now - $startDel).TotalMilliseconds -ge 100) {
-                Show-Progress -Label "$ProgressLabel [delete]" -Current $i -Total $totalDel `
-                              -BytesDone 0 -BytesTotal 0 -StartTime $startDel
-                $startDel = $now
-            }
-        }
-        $sortedDirs = $dstAllDirs | Sort-Object { $_.FullName.Length } -Descending
-        foreach ($dd in $sortedDirs) {
-            $rel = $dd.FullName.Substring($destRootLong.Length).TrimStart('\')
-            if (-not $srcRelDirs.Contains($rel)) {
-                try {
-                    Remove-Item -LiteralPath (To-LongPath $dd.FullName) -Force -Recurse -ErrorAction Stop
-                    $stats.Deleted++
-                } catch {}
-            }
-        }
-        Clear-Progress
-    }
-
-    Save-Manifest -Path $ManifestPath -Entries $newEntries
-    Clear-Progress
-    return $stats
+function Remove-EmptyDirs([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    Get-ChildItem -LiteralPath $Root -Directory -Recurse -Force |
+        Sort-Object { $_.FullName.Length } -Descending |
+        Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force) } |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
 }
 
-# ------------------------------------------------------------
-# ARCHIVE
-# ------------------------------------------------------------
-function Get-ArchiveRoots {
-    param([string]$ChangedRoot, [string]$DriveLetter)
-    return @{
-        Created  = Join-Path (Join-Path $ChangedRoot $ChangedCreatedName)  $DriveLetter
-        Modified = Join-Path (Join-Path $ChangedRoot $ChangedModifiedName) $DriveLetter
-        Deleted  = Join-Path (Join-Path $ChangedRoot $ChangedDeletedName)  $DriveLetter
-        Previous = Join-Path (Join-Path $ChangedRoot '.previous')          $DriveLetter
+function Invoke-FullBackup([string]$Src, [string]$Name, [string]$OriginalPath, [int]$ParentId) {
+    $dst    = Join-Path $FullRoot $Name
+    $marker = Join-Path $dst '.full_complete'
+    Write-Host "`n=== FULL backup: $Src -> $dst ===" -ForegroundColor Cyan
+
+    $excludeRel = @(Get-RelativeExcludes $OriginalPath)
+    if ($excludeRel.Count -gt 0) { Write-Host ("Excluding: " + ($excludeRel -join ', ')) }
+
+    # Pre-count so the progress bar has a total (excluded folders are not scanned)
+    $cmap = Get-FileMap $Src 'source for Full backup' $ParentId $excludeRel
+    $total = $cmap.Count
+    $totalBytes = [long]0
+    foreach ($f in $cmap.Values) { $totalBytes += $f.Length }
+    $cmap = $null
+    if ($total -eq 0) { $total = 1 }
+
+    New-Item -ItemType Directory -Path $dst -Force | Out-Null
+    $log = Join-Path $LogRoot "robocopy_full_$(Get-BackupName $Name)_$Timestamp.log"
+
+    # One output line per copied file -> drives the progress bar
+    $count = 0
+    $roboArgs = @($Src, $dst, '/MIR', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/XJ',
+                  '/NP', '/NC', '/NS', '/NDL', '/NJH', '/NJS', '/FP', '/XF', '.full_complete')
+    if ($excludeRel.Count -gt 0) {
+        $roboArgs += '/XD'
+        foreach ($x in $excludeRel) { $roboArgs += (Join-Path $Src $x) }
     }
-}
-
-function Invoke-Archive-Pass {
-    param(
-        [string]$SourceRoot, [string]$DestRoot,
-        [string]$DriveLetter,
-        [string[]]$ExcludeDirs, [string[]]$ExcludeFiles,
-        [string]$ProgressLabel,
-        [string]$ManifestPath,
-        [string]$ChangedRoot
-    )
-    $stats = [ordered]@{
-        Created=0; Modified=0; Deleted=0; Errors=0
-        BytesCreated=[int64]0; BytesModified=[int64]0; BytesDeleted=[int64]0
-    }
-
-    $roots = Get-ArchiveRoots -ChangedRoot $ChangedRoot -DriveLetter $DriveLetter
-    foreach ($r in $roots.Values) {
-        if (-not (Test-Path -LiteralPath $r)) {
-            New-Item -ItemType Directory -Path $r -Force | Out-Null
-        }
-    }
-
-    $manifest = Load-Manifest -Path $ManifestPath
-    Write-Log ("Archive: loaded previous manifest {0} entries" -f $manifest.Count)
-
-    Show-Progress -Label "$ProgressLabel [archive scan]" -Current 0 -Total 0 -BytesDone 0 -BytesTotal 0 -StartTime (Get-Date)
-    $tree = Get-SourceTree -SourceRoot $SourceRoot -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
-    $srcFiles = $tree.Files
-
-    $srcRootLong = (To-LongPath $SourceRoot).TrimEnd('\')
-    $current = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($f in $srcFiles) {
-        $rel = $f.FullName.Substring($srcRootLong.Length).TrimStart('\')
-        $current[$rel] = [pscustomobject]@{ Size = [int64]$f.Length; Ticks = $f.LastWriteTime.Ticks; FullName = $f.FullName }
-    }
-
-    # --- Pass 1: created + modified ---
-    $startTime = Get-Date
-    $done = 0
-    $total = $current.Count
-
-    foreach ($kv in $current.GetEnumerator()) {
-        $rel  = $kv.Key
-        $info = $kv.Value
-
-        $isCreated  = -not $manifest.ContainsKey($rel)
-        $isModified = $false
-        if (-not $isCreated) {
-            $m = $manifest[$rel]
-            if ($m.Size -ne $info.Size -or $m.Ticks -ne $info.Ticks) { $isModified = $true }
-        }
-
-        if ($isCreated) {
-            $dest = Join-Path $roots.Created $rel
-            if (Copy-OneItem -SourcePath $info.FullName -DestPath $dest) {
-                $stats.Created++
-                $stats.BytesCreated += $info.Size
-            } else { $stats.Errors++ }
-        } elseif ($isModified) {
-            $dest = Join-Path $roots.Modified $rel
-            if (Copy-OneItem -SourcePath $info.FullName -DestPath $dest) {
-                $stats.Modified++
-                $stats.BytesModified += $info.Size
-            } else { $stats.Errors++ }
-
-            # Previous version (if we have it in .previous)
-            $prevSrc = Join-Path $roots.Previous $rel
-            if (Test-Path -LiteralPath (To-LongPath $prevSrc)) {
-                $dir  = Split-Path -Parent $rel
-                $leaf = Split-Path -Leaf   $rel
-                $ext  = [IO.Path]::GetExtension($leaf)
-                $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
-                $leafNew = "$base.vorige-versie$ext"
-                $prevDest = if ($dir) { Join-Path $roots.Modified (Join-Path $dir $leafNew) } else { Join-Path $roots.Modified $leafNew }
-                [void](Copy-OneItem -SourcePath $prevSrc -DestPath $prevDest)
-            }
-        }
-
-        $done++
-        $now = Get-Date
-        if (($now - $startTime).TotalMilliseconds -ge 100) {
-            Show-Progress -Label $ProgressLabel -Current $done -Total $total `
-                          -BytesDone ($stats.BytesCreated + $stats.BytesModified) -BytesTotal 0 -StartTime $startTime
-            $startTime = $now
-        }
-    }
-
-    # --- Pass 2: deleted ---
-    foreach ($kv in $manifest.GetEnumerator()) {
-        $rel = $kv.Key
-        if ($current.ContainsKey($rel)) { continue }
-
-        $prevSrc   = Join-Path $roots.Previous $rel
-        $mirrorSrc = Join-Path $DestRoot $rel
-
-        $srcForDelete = $null
-        if (Test-Path -LiteralPath (To-LongPath $prevSrc))  { $srcForDelete = $prevSrc }
-        elseif (Test-Path -LiteralPath (To-LongPath $mirrorSrc)) { $srcForDelete = $mirrorSrc }
-
-        if ($srcForDelete) {
-            $dest = Join-Path $roots.Deleted $rel
-            if (Copy-OneItem -SourcePath $srcForDelete -DestPath $dest) {
-                $stats.Deleted++
-                try { $stats.BytesDeleted += (Get-Item -LiteralPath (To-LongPath $srcForDelete) -Force).Length } catch {}
-            } else { $stats.Errors++ }
-        } else {
-            Write-Log ("Archive: cannot recover deleted file (no previous copy): $rel") "WARN"
-            $stats.Errors++
-        }
-    }
-
-    # --- Pass 3: refresh .previous with current source ---
-    Clear-Progress
-    Write-Log "Archive: updating .previous tree..." "DEBUG"
-    foreach ($kv in $current.GetEnumerator()) {
-        $rel  = $kv.Key
-        $info = $kv.Value
-        $prevDest = Join-Path $roots.Previous $rel
-        $needsRefresh = $true
-        if (Test-Path -LiteralPath (To-LongPath $prevDest)) {
-            try {
-                $pi = Get-Item -LiteralPath (To-LongPath $prevDest) -Force
-                if ($pi.Length -eq $info.Size -and $pi.LastWriteTime.Ticks -eq $info.Ticks) {
-                    $needsRefresh = $false
-                }
-            } catch {}
-        }
-        if ($needsRefresh) {
-            [void](Copy-OneItem -SourcePath $info.FullName -DestPath $prevDest)
-        }
-    }
-
-    # --- Save manifest ---
-    $newManifest = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($kv in $current.GetEnumerator()) {
-        $newManifest[$kv.Key] = [pscustomobject]@{ Size = $kv.Value.Size; Ticks = $kv.Value.Ticks }
-    }
-    Save-Manifest -Path $ManifestPath -Entries $newManifest
-
-    Clear-Progress
-    return $stats
-}
-
-# ============================================================
-# RUN
-# ============================================================
-
-$volumes = $validSources | ForEach-Object {
-    (Split-Path -Qualifier $_).TrimEnd(':') + ":\"
-} | Sort-Object -Unique
-
-# --- Enforce time-window policy ---
-$policyCheck = Test-ModeAllowedNow -RequestedMode $Mode
-if (-not $policyCheck.Allowed) {
-    Write-Log $policyCheck.Reason "ERROR"
-    Write-Log "=== Backup ended (SKIPPED - outside allowed time window) ==="
-    Close-Log
-    exit 0
-}
-if ($policyCheck.Reason) { Write-Log $policyCheck.Reason "WARN" }
-Write-Log ("Time-window check OK for mode {0} at {1:HH:mm}" -f $Mode, (Get-Date))
-
-$snapshotMap = @{}
-$createdShadowIds = @()
-$createdLinks = @()
-$totalErrors = 0
-
-try {
-    Get-ChildItem "$env:SystemDrive\" -Directory -Force -Filter "VSS_*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^VSS_[A-Z]_(\d+)$' -and
-                       -not (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue) } |
+    & robocopy.exe @roboArgs |
         ForEach-Object {
-            try { Remove-DirLink -Path $_.FullName; Write-Log "Removed stale link $($_.FullName)" }
-            catch { Write-Log "Could not remove stale link $($_.FullName): $_" "WARN" }
+            if ($_ -match '\S') {
+                Add-Content -LiteralPath $log -Value $_
+                $count++
+                Show-Progress -Id 2 -ParentId $ParentId -Activity "Full backup: copying" `
+                    -Status ("{0}/{1} files ({2} total)" -f $count, $total, (Format-Size $totalBytes)) `
+                    -Percent ([int](($count / $total) * 100))
+            }
         }
+    $rc = $LASTEXITCODE
+    Stop-Progress 2
+    if ($rc -ge 8) { throw "Robocopy Full failed for $Src (exit $rc). See $log" }
 
-    foreach ($v in $volumes) {
-        Write-Log "Creating VSS snapshot for $v ..."
-        $shadowId = New-VssSnapshot -Volume $v
-        $createdShadowIds += $shadowId
+    @{ Source = $Src; Completed = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content -LiteralPath $marker -Encoding UTF8
+    (Get-Item -LiteralPath $marker -Force).Attributes = 'Hidden'
+    Write-Host "Full backup completed." -ForegroundColor Green
+}
 
-        $sc = Get-WmiObject Win32_ShadowCopy -Filter "ID='$shadowId'"
-        Write-Log "Snapshot for $v -> $($sc.DeviceObject)"
+function Invoke-IncrementalBackup([string]$Src, [string]$Name, [string]$OriginalPath, [int]$ParentId) {
+    $fullDir = Join-Path $FullRoot $Name
+    $incDir  = Join-Path $IncRoot  $Name
+    $hard    = Get-HardPathName $OriginalPath                              # e.g. C\scripts
+    $archDeletedDir = Join-Path (Join-Path $ArchiveRun 'Deleted') $hard    # ...\Archive\<ts>\Deleted\C\scripts
+    $archChangedDir = Join-Path (Join-Path $ArchiveRun 'Changed') $hard    # ...\Archive\<ts>\Changed\C\scripts
+    Write-Host "`n=== INCREMENTAL + ARCHIVE: $Src ===" -ForegroundColor Cyan
 
-        $letter = $v.Substring(0,1)
-        $link = "$env:SystemDrive\VSS_${letter}_$PID"
-        Remove-DirLink -Path $link
-        cmd.exe /c mklink /d "$link" "$($sc.DeviceObject)\" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "mklink failed for $link" }
+    $excludeRel = @(Get-RelativeExcludes $OriginalPath)
+    if ($excludeRel.Count -gt 0) { Write-Host ("Excluding: " + ($excludeRel -join ', ')) }
 
-        $createdLinks += $link
-        $snapshotMap[$v] = $link
-        Write-Log "Snapshot mounted at $link"
+    $srcMap  = Get-FileMap $Src     'source (VSS snapshot)' $ParentId $excludeRel
+    $fullMap = Get-FileMap $fullDir 'Full backup'           $ParentId $excludeRel
+    $fullMap.Remove('.full_complete')
+
+    $new = @(); $changed = @(); $deleted = @()
+    $i = 0; $n = $srcMap.Count
+    foreach ($rel in @($srcMap.Keys)) {
+        $i++
+        if (-not $fullMap.ContainsKey($rel))                   { $new     += $rel }
+        elseif (Test-FileChanged $srcMap[$rel] $fullMap[$rel]) { $changed += $rel }
+        if (($i % 500) -eq 0) {
+            Show-Progress -Id 3 -ParentId $ParentId -Activity "Comparing source with Full" `
+                -Status "$i/$n files" -Percent ([int](($i / [math]::Max(1, $n)) * 100))
+        }
+    }
+    foreach ($rel in $fullMap.Keys) {
+        if (-not $srcMap.ContainsKey($rel)) { $deleted += $rel }
+    }
+    Stop-Progress 3
+
+    Write-Host ("New: {0}  Changed: {1}  Deleted: {2}" -f $new.Count, $changed.Count, $deleted.Count)
+
+    # --- Incremental: current version of new + changed files ---
+    $wanted = @{}
+    foreach ($rel in ($new + $changed)) { $wanted[$rel] = $true }
+
+    $incMap = Get-FileMap $incDir 'Incremental' $ParentId
+
+    $toCopy = New-Object System.Collections.Generic.List[object]
+    foreach ($rel in $wanted.Keys) {
+        $s = $srcMap[$rel]
+        if ($incMap.ContainsKey($rel) -and -not (Test-FileChanged $s $incMap[$rel])) { continue }  # already up to date
+        $toCopy.Add(@{ From = $s.FullName; To = (Join-Path $incDir $rel); Size = $s.Length })
+    }
+    if ($toCopy.Count -gt 0) {
+        Copy-WithProgress -Items $toCopy -Activity "Incremental: copying new/changed files" -ParentId $ParentId
     }
 
+    # Remove files from Incremental that no longer differ from Full (or are gone)
+    foreach ($rel in @($incMap.Keys)) {
+        if (-not $wanted.ContainsKey($rel)) {
+            Remove-Item -LiteralPath $incMap[$rel].FullName -Force
+        }
+    }
+    Remove-EmptyDirs $incDir
+
+    # --- Archive: Full version of changed files + deleted files ---
+    $archItems = New-Object System.Collections.Generic.List[object]
+    foreach ($rel in $changed) {
+        $archItems.Add(@{ From = $fullMap[$rel].FullName; To = (Join-Path $archChangedDir $rel); Size = $fullMap[$rel].Length })
+    }
+    foreach ($rel in $deleted) {
+        $archItems.Add(@{ From = $fullMap[$rel].FullName; To = (Join-Path $archDeletedDir $rel); Size = $fullMap[$rel].Length })
+    }
+    if ($archItems.Count -gt 0) {
+        Copy-WithProgress -Items $archItems -Activity "Archive: saving Full versions of changed/deleted files" -ParentId $ParentId
+    }
+
+    $manifest = New-Object System.Collections.Generic.List[object]
+    foreach ($rel in $changed) {
+        $manifest.Add([pscustomobject]@{ Status='Changed'; Path=$rel; FullSize=$fullMap[$rel].Length; FullModified=$fullMap[$rel].LastWriteTime; CurrentSize=$srcMap[$rel].Length; CurrentModified=$srcMap[$rel].LastWriteTime })
+    }
+    foreach ($rel in $deleted) {
+        $manifest.Add([pscustomobject]@{ Status='Deleted'; Path=$rel; FullSize=$fullMap[$rel].Length; FullModified=$fullMap[$rel].LastWriteTime; CurrentSize=$null; CurrentModified=$null })
+    }
+    foreach ($rel in $new) {
+        $manifest.Add([pscustomobject]@{ Status='New'; Path=$rel; FullSize=$null; FullModified=$null; CurrentSize=$srcMap[$rel].Length; CurrentModified=$srcMap[$rel].LastWriteTime })
+    }
+
+    if ($manifest.Count -gt 0) {
+        New-Item -ItemType Directory -Path $ArchiveRun -Force | Out-Null
+        $manifest | Sort-Object Status, Path |
+            Export-Csv -LiteralPath (Join-Path $ArchiveRun "manifest_$(Get-BackupName $Name).csv") -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+    }
+    Write-Host "Incremental + Archive completed." -ForegroundColor Green
+}
+
+# --------------------------------- Main ----------------------------------
+
+if (-not (Test-Path "${DestinationDrive}:\")) { throw "Destination drive ${DestinationDrive}: not found." }
+foreach ($d in $DestinationBase, $FullRoot, $IncRoot, $ArchRoot, $LogRoot) {
+    if (Test-Path -LiteralPath $d) { continue }     # also covers a drive root such as F:\
+    try { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    catch { throw "Cannot create destination folder '$d': $_" }
+}
+
+Start-Transcript -Path (Join-Path $LogRoot "backup_$Timestamp.log") | Out-Null
+$snapshots = @{}
+try {
+    $validSources = @($SourceDirs | Where-Object {
+        if (Test-Path -LiteralPath $_) { $true } else { Write-Warning "Source does not exist, skipped: $_"; $false }
+    })
+    if ($validSources.Count -eq 0) { throw "No valid source directories." }
+
+    # One snapshot per volume
+    Show-Progress -Id 1 -Activity "VSS backup" -Status "Creating VSS snapshot(s)" -Percent 0 -Force
     foreach ($src in $validSources) {
-        $v = (Split-Path -Qualifier $src).TrimEnd(':') + ":\"
-        $relative  = $src.Substring($v.Length).TrimStart('\')
-        $shadowSrc = Join-Path $snapshotMap[$v] $relative
-
-        $driveLetter = $v.Substring(0,1).ToUpper()
-        $destPath    = Join-Path $DestinationRoot (Join-Path $driveLetter $relative)
-
-        # Per-source manifest names
-        $safeSrc       = ($relative -replace '[\\/:*?"<>|]', '_')
-        $manifestMirror  = Join-Path $StateRoot ("{0}_{1}.tsv" -f $driveLetter, $safeSrc)
-        $manifestArchive = Join-Path $StateRoot ("_changed_{0}_{1}.tsv" -f $driveLetter, $safeSrc)
-
-        Write-Log "Source : $src"
-        Write-Log "   from: $shadowSrc"
-        Write-Log "   to  : $destPath"
-        Write-Log "   manifest (mirror):  $manifestMirror"
-        Write-Log "   manifest (archive): $manifestArchive"
-
-        $label = $src
-        if ($label.Length -gt 22) { $label = "..." + $label.Substring($label.Length - 19) }
-
-        # ------------------------------------------------
-        # INCREMENTAL (optionally first in BOTH mode)
-        # ------------------------------------------------
-        if ($Mode -eq 'INCREMENTAL' -or $Mode -eq 'BOTH') {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $inc = Sync-Tree-Incremental -SourceRoot $shadowSrc -DestRoot $destPath `
-                                         -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles `
-                                         -MirrorDeletes $MirrorDeletes -ProgressLabel $label `
-                                         -ManifestPath $manifestMirror
-            $sw.Stop()
-            $totalErrors += $inc.Errors
-            Write-Log ("Done [INCREMENTAL]: copied={0} updated={1} skipped={2} deleted={3} errors={4} bytes={5} in {6:n1}s" -f `
-                $inc.Copied, $inc.Updated, $inc.Skipped, $inc.Deleted, $inc.Errors, `
-                (Format-Size $inc.Bytes), $sw.Elapsed.TotalSeconds)
-        }
-
-        # ------------------------------------------------
-        # FULL
-        # ------------------------------------------------
-        if ($Mode -eq 'FULL') {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $f = Sync-Tree-Full -SourceRoot $shadowSrc -DestRoot $destPath `
-                                -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles `
-                                -MirrorDeletes $MirrorDeletes -ProgressLabel $label `
-                                -ManifestPath $manifestMirror
-            $sw.Stop()
-            $totalErrors += $f.Errors
-            Write-Log ("Done [FULL]: copied={0} updated={1} skipped={2} deleted={3} errors={4} bytes={5} in {6:n1}s" -f `
-                $f.Copied, $f.Updated, $f.Skipped, $f.Deleted, $f.Errors, `
-                (Format-Size $f.Bytes), $sw.Elapsed.TotalSeconds)
-        }
-
-        # ------------------------------------------------
-        # ARCHIVE (standalone, or after INCREMENTAL in BOTH mode)
-        # ------------------------------------------------
-        if ($Mode -eq 'ARCHIVE' -or $Mode -eq 'BOTH') {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $a = Invoke-Archive-Pass -SourceRoot $shadowSrc -DestRoot $destPath `
-                                     -DriveLetter $driveLetter `
-                                     -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles `
-                                     -ProgressLabel $label `
-                                     -ManifestPath $manifestArchive `
-                                     -ChangedRoot $ChangedRoot
-            $sw.Stop()
-            $totalErrors += $a.Errors
-            Write-Log ("Done [ARCHIVE]: created={0} modified={1} deleted={2} errors={3} in {4:n1}s" -f `
-                $a.Created, $a.Modified, $a.Deleted, $a.Errors, $sw.Elapsed.TotalSeconds)
-            Write-Log ("             bytes created={0} modified={1} deleted={2}" -f `
-                (Format-Size $a.BytesCreated), (Format-Size $a.BytesModified), (Format-Size $a.BytesDeleted))
-        }
+        $root = [System.IO.Path]::GetPathRoot($src)
+        if (-not $snapshots.ContainsKey($root)) { $snapshots[$root] = New-VssSnapshot $root }
     }
+
+    $idx = 0
+    foreach ($src in $validSources) {
+        $root    = [System.IO.Path]::GetPathRoot($src)
+        $rel     = $src.Substring($root.Length)
+        $snapSrc = if ($rel) { Join-Path $snapshots[$root].Link $rel } else { $snapshots[$root].Link }
+        $name    = Get-HardPathName $src          # C:\scripts -> C\scripts
+        $marker  = Join-Path (Join-Path $FullRoot $name) '.full_complete'
+
+        # Migrate legacy flat folders (C_scripts) to the C\scripts layout
+        $legacy = Get-BackupName $src
+        foreach ($base in $FullRoot, $IncRoot) {
+            $old = Join-Path $base $legacy
+            $new = Join-Path $base $name
+            if ((Test-Path -LiteralPath $old) -and -not (Test-Path -LiteralPath $new)) {
+                New-Item -ItemType Directory -Path (Split-Path -Parent $new) -Force | Out-Null
+                Move-Item -LiteralPath $old -Destination $new
+                Write-Host "Migrated $old -> $new"
+            }
+        }
+
+        Show-Progress -Id 1 -Activity "VSS backup" `
+            -Status ("Source {0}/{1}: {2}" -f ($idx + 1), $validSources.Count, $src) `
+            -Percent ([int](($idx / $validSources.Count) * 100)) -Force
+
+        if ($ForceFull -and (Test-Path -LiteralPath $marker)) {
+            $sup = Join-Path (Join-Path $SuperRoot $Timestamp) $name
+            New-Item -ItemType Directory -Path $sup -Force | Out-Null
+            Move-Item -LiteralPath (Join-Path $FullRoot $name) -Destination (Join-Path $sup 'Full')
+            if (Test-Path -LiteralPath (Join-Path $IncRoot $name)) {
+                Move-Item -LiteralPath (Join-Path $IncRoot $name) -Destination (Join-Path $sup 'Incremental')
+            }
+            Write-Host "Old Full/Incremental of $name moved to $sup"
+        }
+
+        if (-not (Test-Path -LiteralPath $marker)) {
+            Invoke-FullBackup -Src $snapSrc -Name $name -OriginalPath $src -ParentId 1
+        }
+        else {
+            Invoke-IncrementalBackup -Src $snapSrc -Name $name -OriginalPath $src -ParentId 1
+        }
+        $idx++
+    }
+    Show-Progress -Id 1 -Activity "VSS backup" -Status "Finished" -Percent 100 -Force
+
+    # Archive retention
+    if ($ArchiveRetentionDays -gt 0) {
+        $cutoff = (Get-Date).AddDays(-$ArchiveRetentionDays)
+        Get-ChildItem -LiteralPath $ArchRoot -Directory |
+            Where-Object { $_.CreationTime -lt $cutoff } |
+            ForEach-Object { Write-Host "Removing old archive: $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+    }
+
+    Write-Host "`nBackup completed successfully." -ForegroundColor Green
 }
 catch {
-    Clear-Progress
-    Write-Log "Backup aborted: $_" "ERROR"
-    $totalErrors++
+    Write-Error "BACKUP FAILED: $_"
+    exit 1
 }
 finally {
-    Clear-Progress
-    Write-Log "Removing VSS snapshots..."
-    foreach ($link in $createdLinks) {
-        try { Remove-DirLink -Path $link; Write-Log "Link removed: $link" }
-        catch { Write-Log "Failed to remove link $link : $_" "WARN" }
-    }
-    foreach ($id in $createdShadowIds) {
-        try {
-            $sc = Get-WmiObject Win32_ShadowCopy -Filter "ID='$id'"
-            if ($sc) { $sc.Delete() | Out-Null; Write-Log "Snapshot removed: $id" }
-        } catch { Write-Log "Failed to remove snapshot $id : $_" "WARN" }
-    }
-}
-
-# --- Write FULL-done marker on a clean FULL run ---
-if ($Mode -eq 'FULL' -and $totalErrors -eq 0) {
-    try {
-        Set-FullDoneMarker
-        Write-Log "FULL-done marker written for today: $(Get-FullDoneMarkerPath)"
-    } catch {
-        Write-Log "Could not write FULL-done marker: $_" "WARN"
-    }
-}
-
-if ($totalErrors -gt 0) {
-    Write-Log "=== Backup ended (WITH $totalErrors ERRORS) ===" "ERROR"
-    Close-Log
-    exit 16
-} else {
-    Write-Log "=== Backup ended successfully ==="
-    Write-Host ""
-    Write-Host "Log file: $LogFile" -ForegroundColor Cyan
-    Close-Log
-    exit 0
+    Stop-Progress 1
+    foreach ($s in $snapshots.Values) { Remove-VssSnapshot $s }
+    Stop-Transcript | Out-Null
 }
